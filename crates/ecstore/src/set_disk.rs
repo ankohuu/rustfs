@@ -1882,12 +1882,19 @@ impl ObjectOperations for SetDisks {
         fi.transitioned_objname = dest_obj;
         fi.transition_tier = opts.transition.tier.clone();
         fi.transition_version_id = if rv.is_empty() { None } else { Some(Uuid::parse_str(&rv)?) };
-        let mut event_name = EventName::ObjectTransitionComplete.as_str();
+        let event_name = EventName::LifecycleTransition.as_str();
+        let mut should_notify_transition = true;
 
         let disks = self.get_disks(0, 0).await?;
 
         if let Err(err) = self.delete_object_version(bucket, object, &fi, false).await {
-            event_name = EventName::ObjectTransitionFailed.as_str();
+            should_notify_transition = false;
+            warn!(
+                bucket = bucket,
+                object = object,
+                error = ?err,
+                "transition completed on remote tier but source cleanup failed; skipping external lifecycle transition notification"
+            );
         }
 
         for disk in disks.iter() {
@@ -1898,15 +1905,17 @@ impl ObjectOperations for SetDisks {
             break;
         }
 
-        let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
-        send_event(EventArgs {
-            event_name: event_name.to_string(),
-            bucket_name: bucket.to_string(),
-            object: obj_info,
-            user_agent: "Internal: [ILM-Transition]".to_string(),
-            host: GLOBAL_LocalNodeName.to_string(),
-            ..Default::default()
-        });
+        if should_notify_transition {
+            let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+            send_event(EventArgs {
+                event_name: event_name.to_string(),
+                bucket_name: bucket.to_string(),
+                object: obj_info,
+                user_agent: "Internal: [ILM-Transition]".to_string(),
+                host: GLOBAL_LocalNodeName.to_string(),
+                ..Default::default()
+            });
+        }
         //let tags = opts.lifecycle_audit_event.tags();
         //auditLogLifecycle(ctx, objInfo, ILMTransition, tags, traceFn)
         Ok(())
@@ -1961,10 +1970,19 @@ impl ObjectOperations for SetDisks {
                 false,
             )?;
             let mut p_reader = PutObjReader::new(hash_reader);
-            return if let Err(err) = self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
-                set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await
-            } else {
-                Ok(())
+            return match self_.clone().put_object(bucket, object, &mut p_reader, &ropts).await {
+                Ok(restored_info) => {
+                    send_event(EventArgs {
+                        event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+                        bucket_name: bucket.to_string(),
+                        object: restored_info,
+                        user_agent: "Internal: [Restore-Completed]".to_string(),
+                        host: GLOBAL_LocalNodeName.to_string(),
+                        ..Default::default()
+                    });
+                    Ok(())
+                }
+                Err(err) => set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await,
             };
         }
 
@@ -2055,7 +2073,7 @@ impl ObjectOperations for SetDisks {
                 checksum_crc64nvme: None,
             });
         }
-        if let Err(err) = self_
+        let restored_info = match self_
             .clone()
             .complete_multipart_upload(
                 bucket,
@@ -2069,8 +2087,17 @@ impl ObjectOperations for SetDisks {
             )
             .await
         {
-            return set_restore_header_fn(&mut oi, Some(err)).await;
-        }
+            Ok(info) => info,
+            Err(err) => return set_restore_header_fn(&mut oi, Some(err)).await,
+        };
+        send_event(EventArgs {
+            event_name: EventName::ObjectRestoreCompleted.as_str().to_string(),
+            bucket_name: bucket.to_string(),
+            object: restored_info,
+            user_agent: "Internal: [Restore-Completed]".to_string(),
+            host: GLOBAL_LocalNodeName.to_string(),
+            ..Default::default()
+        });
         Ok(())
     }
 
@@ -3973,11 +4000,115 @@ mod tests {
     use super::*;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
+    use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
+    use crate::endpoints::SetupType;
+    use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::store_api::{CompletePart, ObjectInfo};
     use rustfs_filemeta::ErasureInfo;
+    use rustfs_lock::client::local::LocalClient;
+    use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
+    use serial_test::serial;
     use std::collections::HashMap;
     use time::OffsetDateTime;
+
+    #[derive(Debug, Default)]
+    struct FailingClient;
+
+    #[async_trait::async_trait]
+    impl LockClient for FailingClient {
+        async fn acquire_lock(&self, _request: &rustfs_lock::LockRequest) -> rustfs_lock::Result<LockResponse> {
+            Err(LockError::internal("simulated offline client"))
+        }
+
+        async fn release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn refresh(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn force_release(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<bool> {
+            Ok(false)
+        }
+
+        async fn check_status(&self, _lock_id: &rustfs_lock::LockId) -> rustfs_lock::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> rustfs_lock::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> rustfs_lock::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            false
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    async fn make_test_set_disks(lockers: Vec<Arc<dyn LockClient>>) -> Arc<SetDisks> {
+        let endpoints = vec![
+            Endpoint::try_from("http://127.0.0.1:9000/data").expect("first endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9001/data").expect("second endpoint should parse"),
+        ];
+
+        SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(vec![None, None])),
+            2,
+            1,
+            0,
+            0,
+            endpoints,
+            FormatV3::new(1, 2),
+            lockers,
+        )
+        .await
+    }
+
+    struct SetupTypeGuard {
+        previous: SetupType,
+    }
+
+    impl SetupTypeGuard {
+        async fn switch_to(next: SetupType) -> Self {
+            let previous = current_setup_type().await;
+            update_erasure_type(next).await;
+            Self { previous }
+        }
+    }
+
+    impl Drop for SetupTypeGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    update_erasure_type(previous).await;
+                });
+            });
+        }
+    }
+
+    async fn current_setup_type() -> SetupType {
+        if is_dist_erasure().await {
+            SetupType::DistErasure
+        } else if is_erasure_sd().await {
+            SetupType::ErasureSD
+        } else if is_erasure().await {
+            SetupType::Erasure
+        } else {
+            SetupType::Unknown
+        }
+    }
 
     #[test]
     fn disk_health_entry_returns_cached_value_within_ttl() {
@@ -4099,6 +4230,55 @@ mod tests {
         let result3 = SetDisks::get_multipart_sha_dir("bucket1", "object1");
         let result4 = SetDisks::get_multipart_sha_dir("bucket2", "object2");
         assert_ne!(result3, result4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_new_ns_lock_distributed_read_succeeds_with_two_lockers_one_offline() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let healthy_client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+        let failing_client: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let set_disks = make_test_set_disks(vec![healthy_client, failing_client]).await;
+
+        let guard = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_read_lock(Duration::from_millis(100))
+            .await
+            .expect("read lock should succeed with one healthy locker");
+
+        match guard {
+            NamespaceLockGuard::Standard(_) => {}
+            NamespaceLockGuard::Fast(_) => panic!("Expected distributed guard for dist-erasure"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_new_ns_lock_distributed_write_fails_with_two_lockers_one_offline() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
+        let healthy_client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+        let failing_client: Arc<dyn LockClient> = Arc::new(FailingClient);
+        let set_disks = make_test_set_disks(vec![healthy_client, failing_client]).await;
+
+        let err = set_disks
+            .new_ns_lock("bucket", "object")
+            .await
+            .expect("namespace lock should be created")
+            .get_write_lock(Duration::from_millis(100))
+            .await
+            .expect_err("write lock should fail with one healthy locker");
+
+        let err_str = err.to_string().to_lowercase();
+        assert!(
+            err_str.contains("quorum") || err_str.contains("not reached"),
+            "expected quorum error, got: {err}"
+        );
     }
 
     #[test]
